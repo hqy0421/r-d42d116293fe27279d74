@@ -6,6 +6,7 @@ This module contains utility functions.
 
 """
 
+import bisect
 import enum
 import re
 from collections import defaultdict
@@ -1123,6 +1124,307 @@ def find_table(
         result.append(rows[col : rightMost + 1])
 
     return result
+
+
+RowRange = Tuple[int, int]
+"""An inclusive, 1-based row range as ``(start_index, end_index)``."""
+
+
+def _coerce_row_ranges(ranges: Iterable[Sequence[int]], label: str) -> List[RowRange]:
+    """Normalizes ``(start, end)`` pairs into tuples and validates their shape.
+
+    Ranges are 1-based and closed but their bounds against a worksheet size
+    are not checked here, see :func:`plan_row_deletions`.
+
+    :raises ValueError: If a range does not contain exactly two ints, starts
+        below 1, or ends before it starts.
+    """
+    normalized: List[RowRange] = []
+    for index, row_range in enumerate(ranges):
+        if not isinstance(row_range, Sequence) or len(row_range) != 2:
+            raise ValueError(
+                "{} {} must contain exactly 2 elements: a start index and an end index".format(
+                    label, index
+                )
+            )
+        start_index, end_index = row_range[0], row_range[1]
+        if not isinstance(start_index, int) or not isinstance(end_index, int):
+            raise ValueError(
+                "{} {} bounds must be integers: {}".format(label, index, row_range)
+            )
+        if start_index < 1:
+            raise ValueError(
+                "{} {} has a start index lower than 1: ({}, {})".format(
+                    label, index, start_index, end_index
+                )
+            )
+        if end_index < start_index:
+            raise ValueError(
+                "{} {} has an end index lower than its start index: ({}, {})".format(
+                    label, index, start_index, end_index
+                )
+            )
+        normalized.append((start_index, end_index))
+    return normalized
+
+
+def merge_row_ranges(ranges: Iterable[Sequence[int]]) -> List[RowRange]:
+    """Merges overlapping or adjacent 1-based closed ranges.
+
+    :param ranges: An iterable of ``(start_index, end_index)`` pairs. Ranges
+        may be listed in any order and overlap each other.
+    :type ranges: Iterable[Sequence[int]]
+
+    :returns: The merged ranges sorted by start index with no overlaps. An
+        empty input returns an empty list.
+    :rtype: List[Tuple[int, int]]
+
+    :raises ValueError: If a range is malformed, see
+        :func:`_coerce_row_ranges`.
+    """
+    merged: List[RowRange] = []
+    for start_index, end_index in sorted(_coerce_row_ranges(ranges, "range")):
+        if merged and start_index <= merged[-1][1] + 1:
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end_index))
+        else:
+            merged.append((start_index, end_index))
+    return merged
+
+
+def subtract_row_ranges(
+    ranges: Sequence[RowRange], protected_ranges: Iterable[Sequence[int]]
+) -> List[RowRange]:
+    """Subtracts 1-based closed ``protected_ranges`` from ``ranges``.
+
+    Both inputs must already be sorted, disjoint and merged, as returned by
+    :func:`merge_row_ranges`.
+
+    :returns: The parts of ``ranges`` not covered by any protected range,
+        sorted and disjoint. The result may be empty.
+    :rtype: List[Tuple[int, int]]
+    """
+    merged_protected = merge_row_ranges(protected_ranges)
+    result: List[RowRange] = []
+
+    for start_index, end_index in ranges:
+        current_start = start_index
+        for protected_start, protected_end in merged_protected:
+            if protected_end < current_start:
+                continue
+            if protected_start > end_index:
+                break
+            if protected_start > current_start:
+                result.append((current_start, protected_start - 1))
+            current_start = max(current_start, protected_end + 1)
+            if current_start > end_index:
+                break
+        if current_start <= end_index:
+            result.append((current_start, end_index))
+    return result
+
+
+def _ensure_ranges_within_size(
+    ranges: Sequence[RowRange], row_count: int, label: str
+) -> None:
+    """Raises if any 1-based closed range extends past ``row_count``."""
+    for start_index, end_index in ranges:
+        if end_index > row_count:
+            raise ValueError(
+                "{} range ({}, {}) exceeds the worksheet size of {} rows".format(
+                    label, start_index, end_index, row_count
+                )
+            )
+
+
+def _covers_every_row(ranges: Sequence[RowRange], row_count: int) -> bool:
+    """Returns True if sorted disjoint ranges together cover all rows.
+
+    The ranges remove every row only when a chain of adjacent ranges starts
+    at row 1 and reaches the last row; any gap leaves surviving rows.
+    """
+    if not ranges or ranges[0][0] != 1:
+        return False
+    covered_end = ranges[0][1]
+    for start_index, end_index in ranges[1:]:
+        if start_index != covered_end + 1:
+            return False
+        covered_end = end_index
+    return covered_end == row_count
+
+
+def plan_row_deletions(
+    delete_ranges: Iterable[Sequence[int]],
+    row_count: int,
+    keep_ranges: Optional[Iterable[Sequence[int]]] = None,
+) -> List[RowRange]:
+    """Plans the minimum set of contiguous row deletions.
+
+    All ranges are 1-based and closed, interpreted against the worksheet
+    before any deletion. Overlapping ``delete_ranges`` are merged and the
+    optional ``keep_ranges`` (audit rows that must survive even when they
+    fall inside a deletion range) are subtracted.
+
+    :param delete_ranges: The rows requested for deletion as
+        ``(start_index, end_index)`` pairs, in any order. Overlapping and
+        adjacent ranges are merged.
+    :type delete_ranges: Iterable[Sequence[int]]
+    :param int row_count: The number of rows of the worksheet before the
+        deletion.
+    :param keep_ranges: Optional rows that must not be deleted, given with the
+        same format as ``delete_ranges``.
+    :type keep_ranges: Optional[Iterable[Sequence[int]]]
+
+    :returns: The minimum number of disjoint, sorted contiguous ranges to
+        actually delete. An empty list means nothing has to be deleted.
+    :rtype: List[Tuple[int, int]]
+
+    :raises ValueError: If a range is malformed, extends past ``row_count``,
+        or if the requested deletion would remove every row of the
+        worksheet.
+    """
+    if row_count < 1:
+        raise ValueError("row_count must be greater than 0")
+
+    merged_delete = merge_row_ranges(delete_ranges)
+    _ensure_ranges_within_size(merged_delete, row_count, "delete")
+
+    if keep_ranges is not None:
+        merged_keep = merge_row_ranges(keep_ranges)
+        _ensure_ranges_within_size(merged_keep, row_count, "keep")
+        planned = subtract_row_ranges(merged_delete, merged_keep)
+    else:
+        planned = merged_delete
+
+    if _covers_every_row(planned, row_count):
+        raise ValueError(
+            "refusing to delete every row of the worksheet ({} rows)".format(row_count)
+        )
+    return planned
+
+
+class RowDeletionMapping:
+    """Compact bidirectional row number mapping around a row deletion.
+
+    Stores only the contiguous deleted and surviving ranges instead of one
+    entry per row, so its size depends on the number of ranges, not on the
+    number of rows of the worksheet.
+
+    Instances are returned by
+    :meth:`gspread.worksheet.Worksheet.delete_rows_planned` and are typically
+    not built manually. Both :meth:`old_to_new` and :meth:`new_to_old` run in
+    logarithmic time relative to the number of ranges.
+
+    .. versionadded:: 6.3.0
+    """
+
+    def __init__(
+        self,
+        deleted_ranges: Sequence[RowRange],
+        row_count: int,
+    ) -> None:
+        self._deleted_ranges: List[RowRange] = list(deleted_ranges)
+        self._row_count = row_count
+
+        # raw API response of the deletion, set by Worksheet.delete_rows_planned;
+        # None when the deletion was a no-op
+        self.api_response: Optional[Mapping[str, Any]] = None
+
+        # surviving segments derived from the sorted deleted ranges, each
+        # annotated with the cumulative number of rows deleted before it,
+        # i.e. the offset between old and new indexes inside that segment
+        self._survivor_starts: List[int] = []
+        self._survivor_offsets: List[int] = []
+
+        deleted_before = 0
+        cursor = 1
+        for start_index, end_index in self._deleted_ranges:
+            if start_index > cursor:
+                self._survivor_starts.append(cursor)
+                self._survivor_offsets.append(deleted_before)
+            cursor = end_index + 1
+            deleted_before += end_index - start_index + 1
+        if cursor <= row_count:
+            self._survivor_starts.append(cursor)
+            self._survivor_offsets.append(deleted_before)
+
+        # new row 1..n map back to survivor segments in order. The first new
+        # row of a segment is its old start minus the rows deleted before it
+        self._new_segment_starts: List[int] = [
+            old_start - offset
+            for old_start, offset in zip(self._survivor_starts, self._survivor_offsets)
+        ]
+
+    @property
+    def deleted_ranges(self) -> List[RowRange]:
+        """The deleted ranges, sorted and disjoint (1-based, closed)."""
+        return list(self._deleted_ranges)
+
+    @property
+    def old_row_count(self) -> int:
+        """Number of rows before the deletion."""
+        return self._row_count
+
+    @property
+    def new_row_count(self) -> int:
+        """Number of rows after the deletion."""
+        return self._row_count - sum(
+            end - start + 1 for start, end in self._deleted_ranges
+        )
+
+    def is_deleted(self, old_row: int) -> bool:
+        """Returns ``True`` if ``old_row`` was removed by the deletion.
+
+        :raises ValueError: If ``old_row`` is outside ``1..old_row_count``.
+        """
+        if not isinstance(old_row, int) or old_row < 1 or old_row > self._row_count:
+            raise ValueError(
+                "old row {} is outside the worksheet range 1..{}".format(
+                    old_row, self._row_count
+                )
+            )
+        index = bisect.bisect_right(self._deleted_ranges, (old_row, self._row_count))
+        if index == 0:
+            return False
+        start_index, end_index = self._deleted_ranges[index - 1]
+        return start_index <= old_row <= end_index
+
+    def old_to_new(self, old_row: int) -> Optional[int]:
+        """Returns the new position of a row that survived, or ``None``.
+
+        A ``None`` result means ``old_row`` was deleted. Use
+        :meth:`is_deleted` to distinguish a deleted row from a missing value.
+
+        :raises ValueError: If ``old_row`` is outside ``1..old_row_count``.
+        """
+        if self.is_deleted(old_row):
+            return None
+        index = bisect.bisect_right(self._survivor_starts, old_row) - 1
+        return old_row - self._survivor_offsets[index]
+
+    def new_to_old(self, new_row: int) -> int:
+        """Returns the pre-deletion position of a current row.
+
+        :raises ValueError: If ``new_row`` is outside ``1..new_row_count``.
+        """
+        new_count = self.new_row_count
+        if not isinstance(new_row, int) or new_row < 1 or new_row > new_count:
+            raise ValueError(
+                "new row {} is outside the remaining worksheet range 1..{}".format(
+                    new_row, new_count
+                )
+            )
+        index = bisect.bisect_right(self._new_segment_starts, new_row) - 1
+        offset = new_row - self._new_segment_starts[index]
+        return self._survivor_starts[index] + offset
+
+    def __repr__(self) -> str:
+        return "<{} old_rows={} new_rows={} deleted={}>".format(
+            self.__class__.__name__,
+            self.old_row_count,
+            self.new_row_count,
+            self._deleted_ranges,
+        )
 
 
 # SHOULD NOT BE NEEDED UNTIL NEXT MAJOR VERSION

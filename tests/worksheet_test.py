@@ -2,8 +2,10 @@ import itertools
 import pickle  # nosec
 import random
 import re
+import unittest
 from inspect import signature
 from typing import Generator
+from unittest.mock import MagicMock
 
 import pytest
 from pytest import FixtureRequest
@@ -12,6 +14,7 @@ import gspread
 from gspread import utils
 from gspread.client import Client
 from gspread.exceptions import APIError, GSpreadException
+from gspread.http_client import HTTPClient
 from gspread.spreadsheet import Spreadsheet
 from gspread.worksheet import Worksheet
 
@@ -2074,3 +2077,102 @@ class WorksheetTest(GspreadTest):
         # Further ensure we are able to access the exception's properties after pickling
         reloaded_exception = pickle.loads(pickle.dumps(ex.exception))  # nosec
         self.assertEqual(reloaded_exception.args[0]["status"], "INVALID_ARGUMENT")
+
+
+class WorksheetPlannedDeletionTest(unittest.TestCase):
+    """Offline tests for Worksheet.delete_rows_planned using a mocked client.
+
+    The range/mapping math itself is covered in tests/utils_test.py; these
+    tests focus on request construction, ordering, row_count bookkeeping and
+    the no-request path.
+    """
+
+    ROW_COUNT = 20
+
+    def setUp(self):
+        self.client = MagicMock(spec=HTTPClient)
+        self.client.batch_update.return_value = {"replies": []}
+        self.properties = {
+            "sheetId": 7,
+            "title": "Sheet1",
+            "index": 0,
+            "gridProperties": {
+                "rowCount": self.ROW_COUNT,
+                "columnCount": 5,
+            },
+        }
+        self.worksheet = Worksheet(
+            MagicMock(),
+            self.properties,
+            spreadsheet_id="spreadsheet-id",
+            client=self.client,
+        )
+
+    def _request_ranges(self):
+        body = self.client.batch_update.call_args.args[1]
+        return [
+            (
+                request["deleteDimension"]["range"]["startIndex"],
+                request["deleteDimension"]["range"]["endIndex"],
+            )
+            for request in body["requests"]
+        ]
+
+    def test_merges_overlapping_rules_and_subtracts_keep_ranges(self):
+        mapping = self.worksheet.delete_rows_planned(
+            delete_ranges=[(2, 6), (5, 9)],
+            keep_ranges=[(4, 4), (8, 8)],
+        )
+
+        # planned 1-based blocks (2,3)(5,7)(9,9), emitted bottom-up as
+        # half-open API indexes in a single batch_update call
+        self.assertEqual(self.client.batch_update.call_count, 1)
+        self.assertEqual(self._request_ranges(), [(8, 9), (4, 7), (1, 3)])
+
+        # local row count follows the number of actually deleted rows
+        self.assertEqual(self.worksheet.row_count, 14)
+        self.assertEqual(mapping.old_row_count, 20)
+        self.assertEqual(mapping.new_row_count, 14)
+        self.assertEqual(mapping.api_response, {"replies": []})
+
+        # compact bidirectional mapping, deleted rows identifiable
+        self.assertTrue(mapping.is_deleted(9))
+        self.assertIsNone(mapping.old_to_new(9))
+        self.assertEqual(mapping.old_to_new(8), 3)
+        self.assertEqual(mapping.new_to_old(3), 8)
+
+    def test_adjacent_blocks_merged_into_minimal_single_request(self):
+        self.worksheet.delete_rows_planned([(3, 5), (6, 8)])
+
+        self.assertEqual(len(self._request_ranges()), 1)
+        self.assertEqual(self._request_ranges(), [(2, 8)])
+        self.assertEqual(self.worksheet.row_count, 14)
+
+    def test_empty_effective_deletion_sends_no_request(self):
+        # keep ranges cancel every deletion: no API call, identity mapping
+        mapping = self.worksheet.delete_rows_planned(
+            delete_ranges=[(2, 4)], keep_ranges=[(2, 4)]
+        )
+
+        self.client.batch_update.assert_not_called()
+        self.assertIsNone(mapping.api_response)
+        self.assertEqual(mapping.new_row_count, self.ROW_COUNT)
+        self.assertEqual(mapping.old_to_new(4), 4)
+        self.assertEqual(self.worksheet.row_count, self.ROW_COUNT)
+
+    def test_validation_errors_raised_before_any_request(self):
+        invalid_inputs = [
+            {"delete_ranges": [(1, self.ROW_COUNT)]},  # delete every row
+            {"delete_ranges": [(self.ROW_COUNT + 1, self.ROW_COUNT + 2)]},
+            {"delete_ranges": [(3, 2)]},  # end before start
+            {
+                "delete_ranges": [(1, 5)],
+                "keep_ranges": [(0, 1)],  # keep range starts below 1
+            },
+        ]
+        for kwargs in invalid_inputs:
+            with self.assertRaises(ValueError):
+                self.worksheet.delete_rows_planned(**kwargs)
+
+        self.client.batch_update.assert_not_called()
+        self.assertEqual(self.worksheet.row_count, self.ROW_COUNT)

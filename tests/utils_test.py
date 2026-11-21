@@ -690,3 +690,191 @@ class UtilsTest(unittest.TestCase):
         table = utils.find_table(values, "A1", utils.TableDirection.table)
 
         self.assertListEqual(table, [], "resulting table should be empty")
+
+
+class RowDeletionPlanningTest(unittest.TestCase):
+    """Tests for the row range merge/subtract/plan helpers."""
+
+    def test_merge_row_ranges_overlapping_unsorted_and_adjacent(self):
+        self.assertEqual(
+            utils.merge_row_ranges([(5, 9), (2, 4), (8, 12), (20, 20)]),
+            [(2, 12), (20, 20)],
+        )
+        # adjacent ranges collapse into a single contiguous range
+        self.assertEqual(utils.merge_row_ranges([(3, 5), (6, 8)]), [(3, 8)])
+        # lists and tuples are both accepted, duplicates merge away
+        self.assertEqual(utils.merge_row_ranges([[3, 3], (3, 5)]), [(3, 5)])
+        self.assertEqual(utils.merge_row_ranges([]), [])
+
+    def test_merge_row_ranges_validation(self):
+        malformed = [
+            [(1,)],
+            [(1, 2, 3)],
+            [(0, 2)],
+            [(5, 3)],
+            [(1, 2.5)],
+        ]
+        for ranges in malformed:
+            with self.assertRaises(ValueError):
+                utils.merge_row_ranges(ranges)
+
+    def test_subtract_row_ranges(self):
+        base = utils.merge_row_ranges([(1, 10)])
+        self.assertEqual(
+            utils.subtract_row_ranges(base, [(4, 4), (8, 8)]),
+            [(1, 3), (5, 7), (9, 10)],
+        )
+        # subtracting the whole range leaves nothing
+        self.assertEqual(
+            utils.subtract_row_ranges(utils.merge_row_ranges([(2, 9)]), [(2, 9)]),
+            [],
+        )
+        # non-overlapping protected ranges leave the base untouched
+        self.assertEqual(
+            utils.subtract_row_ranges(base, [(20, 30)]),
+            [(1, 10)],
+        )
+        # protected range spanning several merged blocks
+        self.assertEqual(
+            utils.subtract_row_ranges(
+                utils.merge_row_ranges([(1, 4), (6, 10)]), [(3, 7)]
+            ),
+            [(1, 2), (8, 10)],
+        )
+
+    def test_plan_row_deletions_merges_and_subtracts_keep_ranges(self):
+        planned = utils.plan_row_deletions(
+            [(2, 6), (5, 9)], 20, keep_ranges=[(4, 4), (8, 8)]
+        )
+        self.assertEqual(planned, [(2, 3), (5, 7), (9, 9)])
+
+    def test_plan_row_deletions_returns_empty_when_keep_covers_everything(self):
+        # no request must be needed: empty plan rather than an error
+        self.assertEqual(
+            utils.plan_row_deletions([(5, 7)], 20, keep_ranges=[(5, 7)]),
+            [],
+        )
+        self.assertEqual(utils.plan_row_deletions([], 20), [])
+
+    def test_plan_row_deletions_rejects_ranges_past_worksheet_size(self):
+        with self.assertRaises(ValueError):
+            utils.plan_row_deletions([(1, 21)], 20)
+        with self.assertRaises(ValueError):
+            utils.plan_row_deletions([(1, 5)], 20, keep_ranges=[(19, 21)])
+
+    def test_plan_row_deletions_rejects_deleting_every_row(self):
+        # a single rule covering the whole sheet
+        with self.assertRaises(ValueError):
+            utils.plan_row_deletions([(1, 20)], 20)
+        # ... including adjacent rules that together cover every row
+        with self.assertRaises(ValueError):
+            utils.plan_row_deletions([(1, 10), (11, 15), (16, 20)], 20)
+        # keeping at least one row makes the same input acceptable
+        self.assertEqual(
+            utils.plan_row_deletions([(1, 10), (11, 20)], 20, keep_ranges=[(7, 7)]),
+            [(1, 6), (8, 20)],
+        )
+
+    def test_plan_row_deletions_rejects_malformed_ranges(self):
+        with self.assertRaises(ValueError):
+            utils.plan_row_deletions([(0, 3)], 20)
+        with self.assertRaises(ValueError):
+            utils.plan_row_deletions([(3, 2)], 20)
+
+
+class RowDeletionMappingTest(unittest.TestCase):
+    """Tests for the compact bidirectional row number mapping."""
+
+    def setUp(self):
+        # deleted 2-3, 5-7 and 9 out of 12 rows
+        self.mapping = utils.RowDeletionMapping([(2, 3), (5, 7), (9, 9)], 12)
+
+    def test_counts_and_deleted_ranges(self):
+        self.assertEqual(self.mapping.old_row_count, 12)
+        self.assertEqual(self.mapping.new_row_count, 6)
+        self.assertEqual(self.mapping.deleted_ranges, [(2, 3), (5, 7), (9, 9)])
+
+    def test_old_to_new(self):
+        # survivors old 1,4,8,10,11,12 map to new 1,2,3,4,5,6
+        expected = {1: 1, 4: 2, 8: 3, 10: 4, 11: 5, 12: 6}
+        for old_row, new_row in expected.items():
+            self.assertEqual(self.mapping.old_to_new(old_row), new_row)
+        for deleted_row in (2, 3, 5, 6, 7, 9):
+            self.assertIsNone(self.mapping.old_to_new(deleted_row))
+            self.assertTrue(self.mapping.is_deleted(deleted_row))
+
+    def test_new_to_old_round_trip(self):
+        for old_row in range(1, 13):
+            new_row = self.mapping.old_to_new(old_row)
+            if new_row is not None:
+                self.assertEqual(self.mapping.new_to_old(new_row), old_row)
+                self.assertFalse(self.mapping.is_deleted(old_row))
+
+    def test_out_of_range_lookups_raise(self):
+        for bad_row in (0, 13, -1):
+            with self.assertRaises(ValueError):
+                self.mapping.old_to_new(bad_row)
+            with self.assertRaises(ValueError):
+                self.mapping.is_deleted(bad_row)
+        for bad_row in (0, 7, 12):
+            with self.assertRaises(ValueError):
+                self.mapping.new_to_old(bad_row)
+
+    def test_identity_mapping_for_empty_deletion(self):
+        identity = utils.RowDeletionMapping([], 5)
+        self.assertEqual(identity.new_row_count, 5)
+        self.assertEqual(identity.deleted_ranges, [])
+        for row in range(1, 6):
+            self.assertEqual(identity.old_to_new(row), row)
+            self.assertEqual(identity.new_to_old(row), row)
+            self.assertFalse(identity.is_deleted(row))
+
+    def test_deletion_at_the_top_and_bottom(self):
+        # first and last rows removed, survivors keep a stable relative order
+        mapping = utils.RowDeletionMapping([(1, 1), (10, 10)], 10)
+        self.assertEqual(mapping.new_row_count, 8)
+        self.assertEqual(mapping.old_to_new(2), 1)
+        self.assertEqual(mapping.old_to_new(9), 8)
+        self.assertEqual(mapping.new_to_old(1), 2)
+        self.assertEqual(mapping.new_to_old(8), 9)
+        self.assertTrue(mapping.is_deleted(1) and mapping.is_deleted(10))
+
+    def test_exhaustive_round_trip(self):
+        # every deletion pattern over small sheets: bidirectional lookups
+        # must stay consistent without expanding the full table
+        for row_count in range(1, 18):
+            for pattern in range(1, (1 << min(row_count, 8))):
+                deleted_ranges = []
+                start = None
+                for index in range(row_count):
+                    deleted = bool((pattern >> (index % 8)) & 1)
+                    row = index + 1
+                    if deleted and start is None:
+                        start = row
+                    elif not deleted and start is not None:
+                        deleted_ranges.append((start, row - 1))
+                        start = None
+                if start is not None:
+                    deleted_ranges.append((start, row_count))
+                if (
+                    len(deleted_ranges) == 0
+                    or len(deleted_ranges) == 1
+                    and (deleted_ranges[0] == (1, row_count))
+                ):
+                    continue
+                mapping = utils.RowDeletionMapping(deleted_ranges, row_count)
+                survivors = [
+                    row
+                    for row in range(1, row_count + 1)
+                    if not mapping.is_deleted(row)
+                ]
+                self.assertEqual(mapping.new_row_count, len(survivors))
+                for new_row, old_row in enumerate(survivors, start=1):
+                    self.assertEqual(mapping.old_to_new(old_row), new_row)
+                    self.assertEqual(mapping.new_to_old(new_row), old_row)
+
+    def test_repr_is_compact(self):
+        # the representation shows ranges, never one entry per row
+        text = repr(self.mapping)
+        self.assertIn("RowDeletionMapping", text)
+        self.assertIn("(2, 3)", text)

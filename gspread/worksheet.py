@@ -41,6 +41,7 @@ from .utils import (
     MergeType,
     PasteOrientation,
     PasteType,
+    RowDeletionMapping,
     T,
     TableDirection,
     ValidationConditionType,
@@ -60,6 +61,7 @@ from .utils import (
     get_a1_from_absolute_range,
     is_full_a1_notation,
     numericise_all,
+    plan_row_deletions,
     rowcol_to_a1,
     to_records,
 )
@@ -2393,6 +2395,92 @@ class Worksheet:
         .. versionadded:: 6.3.0
         """
         return self.delete_dimension_blocks(Dimension.cols, blocks)
+
+    def delete_rows_planned(
+        self,
+        delete_ranges: Sequence[Sequence[int]],
+        keep_ranges: Optional[Sequence[Sequence[int]]] = None,
+    ) -> "RowDeletionMapping":
+        """Deletes rows planned from overlapping deletion rules while keeping
+        audit rows, and returns a compact mapping of the resulting row shifts.
+
+        Unlike :meth:`~gspread.worksheet.Worksheet.delete_rows_blocks`, the
+        deletion ranges may overlap each other: they are merged first. The
+        optional ``keep_ranges`` are then subtracted so that audit rows
+        survive even when a deletion rule covers them. Every range is
+        1-based and closed, interpreted against the rows of the worksheet
+        before any deletion.
+
+        The minimum number of contiguous ``deleteDimension`` requests is
+        submitted, all within a single
+        :meth:`~gspread.client.Client.batch_update` call and ordered from the
+        bottom up so that earlier ranges are not shifted by later ones.
+
+        :param delete_ranges: A sequence of ``(start_index, end_index)``
+            pairs of rows requested for deletion. May be in any order and may
+            overlap or be adjacent.
+        :type delete_ranges: Sequence[Sequence[int]]
+        :param keep_ranges: An optional sequence of ``(start_index,
+            end_index)`` pairs of rows that must not be deleted.
+        :type keep_ranges: Optional[Sequence[Sequence[int]]]
+
+        :returns: A :class:`~gspread.utils.RowDeletionMapping` providing
+            bidirectional old/new row number lookups. Its ``api_response``
+            attribute holds the raw API response (``None`` when nothing had
+            to be deleted).
+        :rtype: ~gspread.utils.RowDeletionMapping
+
+        :raises ValueError: If a range is malformed, extends past the current
+            number of rows, or if the result would delete every row of the
+            worksheet.
+
+        Example::
+
+            # quality rules flag rows 2-6 and 5-9, but rows 4 and 8 are
+            # audit rows that must be kept
+            mapping = worksheet.delete_rows_planned(
+                delete_ranges=[(2, 6), (5, 9)],
+                keep_ranges=[(4, 4), (8, 8)],
+            )
+            mapping.old_to_new(8)   # new position of former row 8 -> 3
+            mapping.new_to_old(3)   # pre-deletion position of current row 3 -> 8
+            mapping.is_deleted(2)   # True
+
+        .. versionadded:: 6.3.0
+        """
+        planned_ranges = plan_row_deletions(delete_ranges, self.row_count, keep_ranges)
+
+        mapping = RowDeletionMapping(planned_ranges, self.row_count)
+        if not planned_ranges:
+            # nothing to do: do not send an empty request to the API
+            mapping.api_response = None
+            return mapping
+
+        # delete bottom-most ranges first so that the indexes of the
+        # remaining ranges are not shifted by preceding deletions
+        body = {
+            "requests": [
+                {
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": self.id,
+                            "dimension": Dimension.rows,
+                            "startIndex": start_index - 1,
+                            "endIndex": end_index,
+                        }
+                    }
+                }
+                for start_index, end_index in reversed(planned_ranges)
+            ]
+        }
+
+        res = self.client.batch_update(self.spreadsheet_id, body)
+        num_deleted = sum(
+            end_index - start_index + 1 for start_index, end_index in planned_ranges
+        )
+        self._properties["gridProperties"]["rowCount"] -= num_deleted
+        mapping.api_response = res
+        return mapping
 
     def clear(self) -> JSONResponse:
         """Clears all cells in the worksheet."""
